@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        .cve-card {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            border: 2px solid #d32f2f;
+            border-radius: 8px;
+            padding: 20px;
+            background-color: #fff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .cve-header {
+            background-color: #d32f2f;
+            color: white;
+            padding: 15px;
+            margin: -20px -20px 20px -20px;
+            border-radius: 6px 6px 0 0;
+        }
+        .cve-id {
+            font-size: 24px;
+            font-weight: bold;
+            margin: 0;
+        }
+        .cve-section {
+            margin-bottom: 20px;
+        }
+        .cve-label {
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        .cve-value {
+            color: #666;
+            line-height: 1.6;
+        }
+        .severity {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 4px;
+            color: white;
+            font-weight: bold;
+        }
+        .severity-critical { background-color: #d32f2f; }
+        .severity-high { background-color: #f57c00; }
+        .severity-medium { background-color: #fbc02d; color: #333; }
+        .severity-low { background-color: #388e3c; }
+        .cve-metadata {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="cve-card">
+        <div class="cve-header">
+            <h1 class="cve-id">{{ cve_number }}</h1>
+            {% if cve_title %}
+            <h2 style="margin-top: 10px; font-size: 18px;">{{ cve_title }}</h2>
+            {% endif %}
+        </div>
+        
+        <div class="cve-section">
+            <div class="cve-label">Description:</div>
+            <div class="cve-value">{{ description }}</div>
+        </div>
+        
+        {% if severity %}
+        <div class="cve-section">
+            <div class="cve-label">Severity:</div>
+            <span class="severity severity-{{ severity.lower() }}">{{ severity }}</span>
+        </div>
+        {% endif %}
+        
+        <div class="cve-metadata">
+            {% if cvss_score %}
+            <div class="cve-section">
+                <div class="cve-label">CVSS Score:</div>
+                <div class="cve-value">{{ cvss_score }}</div>
+            </div>
+            {% endif %}
+            
+            {% if classifications_location %}
+            <div class="cve-section">
+                <div class="cve-label">Location:</div>
+                <div class="cve-value">{{ classifications_location }}</div>
+            </div>
+            {% endif %}
+            
+            {% if classifications_attack_type %}
+            <div class="cve-section">
+                <div class="cve-label">Attack Type:</div>
+                <div class="cve-value">{{ classifications_attack_type }}</div>
+            </div>
+            {% endif %}
+            
+            {% if classifications_impact %}
+            <div class="cve-section">
+                <div class="cve-label">Impact:</div>
+                <div class="cve-value">{{ classifications_impact }}</div>
+            </div>
+            {% endif %}
+            
+            {% if classifications_exploit %}
+            <div class="cve-section">
+                <div class="cve-label">Exploit Status:</div>
+                <div class="cve-value">{{ classifications_exploit }}</div>
+            </div>
+            {% endif %}
+            
+            {% if cisa_key %}
+            <div class="cve-section">
+                <div class="cve-label">CISA Key Vulnerability:</div>
+                <div class="cve-value">{{ cisa_key }}</div>
+            </div>
+            {% endif %}
+        </div>
+        
+        {% if affected_products %}
+        <div class="cve-section">
+            <div class="cve-label">Affected Products:</div>
+            <div class="cve-value">{{ affected_products }}</div>
+        </div>
+        {% endif %}
+        
+        {% if solution %}
+        <div class="cve-section">
+            <div class="cve-label">Solution:</div>
+            <div class="cve-value">{{ solution }}</div>
+        </div>
+        {% endif %}
+        
+        {% if exploit_code_maturity or remediation_level or report_confidence %}
+        <div class="cve-section">
+            <div class="cve-label">Additional Details:</div>
+            <div class="cve-metadata">
+                {% if exploit_code_maturity %}
+                <div class="cve-section">
+                    <div class="cve-label">Exploit Maturity:</div>
+                    <div class="cve-value">{{ exploit_code_maturity }}</div>
+                </div>
+                {% endif %}
+                {% if remediation_level %}
+                <div class="cve-section">
+                    <div class="cve-label">Remediation Level:</div>
+                    <div class="cve-value">{{ remediation_level }}</div>
+                </div>
+                {% endif %}
+                {% if report_confidence %}
+                <div class="cve-section">
+                    <div class="cve-label">Report Confidence:</div>
+                    <div class="cve-value">{{ report_confidence }}</div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+        
+        {% if input_vector %}
+        <div class="cve-section">
+            <div class="cve-label">CVSS Vector:</div>
+            <div class="cve-value" style="font-family: monospace; font-size: 12px;">{{ input_vector }}</div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

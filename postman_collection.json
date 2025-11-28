@@ -1,0 +1,159 @@
+{
+  "info": {
+    "name": "LangGraph MCP FastAPI",
+    "description": "API collection for testing the LangGraph MCP FastAPI Application",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8000/health",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["health"]
+        },
+        "description": "Check if the API is running and healthy"
+      }
+    },
+    {
+      "name": "Root Info",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:8000/",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": [""]
+        },
+        "description": "Get API information and available endpoints"
+      }
+    },
+    {
+      "name": "Query - Single CVE",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"What is CVE-2023-52341?\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/query",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["query"]
+        },
+        "description": "Query for a single CVE - uses MCP tools only"
+      }
+    },
+    {
+      "name": "Query - CVE with Explanation",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Tell me about CVE-2024-12345\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/query",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["query"]
+        },
+        "description": "Query for CVE with explanation - uses MCP tools + LLM"
+      }
+    },
+    {
+      "name": "Query - Multiple Questions",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"What is the weather in Ireland and also what is CVE-2023-52341?\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/query",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["query"]
+        },
+        "description": "Query with multiple questions - uses both MCP tools and LLM"
+      }
+    },
+    {
+      "name": "Query - General Question",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"Explain what a CVE is\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/query",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["query"]
+        },
+        "description": "General question - uses LLM only"
+      }
+    },
+    {
+      "name": "Query - Multiple CVEs",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"query\": \"CVE-2023-52341 and CVE-2024-12345\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:8000/query",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "8000",
+          "path": ["query"]
+        },
+        "description": "Query for multiple CVEs - uses MCP tools"
+      }
+    }
+  ]
+}
