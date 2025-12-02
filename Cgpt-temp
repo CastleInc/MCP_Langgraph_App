@@ -1,0 +1,11 @@
+payload_text = json.dumps(synth_context, indent=2, default=str)
+
+msgs = state.get("messages") or []
+if not isinstance(msgs, list):
+    msgs = list(msgs) if isinstance(msgs, (tuple, set)) else [msgs]
+
+# if your messages are LangChain objects
+if msgs and hasattr(msgs[0], "type"):
+    state["messages"] = msgs + [AIMessage(content=payload_text)]
+else:
+    state["messages"] = msgs + [{"role": "assistant", "content": payload_text}]
