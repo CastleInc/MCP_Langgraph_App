@@ -1,11 +1,42 @@
-payload_text = json.dumps(synth_context, indent=2, default=str)
+import traceback
+import json
 
-msgs = state.get("messages") or []
-if not isinstance(msgs, list):
-    msgs = list(msgs) if isinstance(msgs, (tuple, set)) else [msgs]
+logger.info("=== DEBUG: about to append synth_context message ===")
+logger.info("messages type=%s", type(messages))
+logger.info("state['messages'] type=%s", type(state.get("messages")))
+logger.info("messages len=%s", len(messages) if hasattr(messages, "__len__") else "N/A")
 
-# if your messages are LangChain objects
-if msgs and hasattr(msgs[0], "type"):
-    state["messages"] = msgs + [AIMessage(content=payload_text)]
-else:
-    state["messages"] = msgs + [{"role": "assistant", "content": payload_text}]
+if isinstance(messages, list) and messages:
+    logger.info("messages[0] type=%s", type(messages[0]))
+    logger.info("messages[-1] type=%s", type(messages[-1]))
+    # LangChain objects often have .type
+    logger.info("messages[-1].type=%s", getattr(messages[-1], "type", None))
+
+# Step A: isolate JSON serialization errors
+try:
+    payload_text = json.dumps(synth_context, indent=2)
+    logger.info("json.dumps succeeded. payload length=%d", len(payload_text))
+except Exception as e:
+    logger.error("json.dumps FAILED: %s", e, exc_info=True)
+    # Make it succeed so you can move on
+    payload_text = json.dumps(synth_context, indent=2, default=str)
+    logger.info("json.dumps with default=str succeeded. payload length=%d", len(payload_text))
+
+# Step B: isolate AIMessage construction errors
+try:
+    test_msg = AIMessage(content=payload_text)
+    logger.info("AIMessage construction OK. type=%s", type(test_msg))
+except Exception as e:
+    logger.error("AIMessage construction FAILED: %s", e, exc_info=True)
+    raise  # re-raise so you see the full stack trace
+
+# Step C: isolate list concatenation / state assignment errors
+try:
+    test_new_messages = messages + [test_msg]
+    logger.info("messages + [AIMessage] OK. new_len=%d", len(test_new_messages))
+except Exception as e:
+    logger.error("messages + [AIMessage] FAILED: %s", e, exc_info=True)
+    raise
+
+logger.info("=== DEBUG: append checks passed; doing assignment now ===")
+state["messages"] = test_new_messages
