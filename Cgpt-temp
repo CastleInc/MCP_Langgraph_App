@@ -120,3 +120,208 @@ else:
     # no remaining direct question, go aggregate
     state["next_step"] = AGGREGATE
 
+
+
+import logging
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+from langchain.output_parsers import PydanticOutputParser
+from langchain.prompts import ChatPromptTemplate
+
+from cstgenai_common_entities.model import RETRIEVE, GENERATE, END  # keep your constants
+from cstgenai_common_entities.model import AGENT_WITH_TOOLS, PDF_EXTRACT_INFO  # if you use these
+from cstgenai_rag.model.state import GraphState
+from cstgenai_rag.llm.llm_client import get_llm
+
+# Your existing helpers (based on your screenshots)
+# - get_tools_for_agent(state)
+# - render_text_description(tools)
+from cstgenai_rag.support.tools import get_tools_for_agent, render_text_description
+
+logger = logging.getLogger(__name__)
+
+DatasourceType = Literal[RETRIEVE, GENERATE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO]
+
+
+class RouteQuery(BaseModel):
+    """
+    Router output schema.
+
+    datasource:
+      - AGENT_WITH_TOOLS: use MCP tools
+      - RETRIEVE: use vector store/docs retrieval
+      - GENERATE: general LLM answer
+      - PDF_EXTRACT_INFO: file-based extraction (if you have it)
+    """
+    datasource: DatasourceType = Field(
+        description="Choose where to route the user query."
+    )
+
+    tools_needed: int = Field(
+        default=0,
+        description="How many tool calls are needed (0 if none)."
+    )
+
+    tool_question: Optional[str] = Field(
+        default=None,
+        description="Only the part of the user query that MUST be solved via tools."
+    )
+
+    general_question: Optional[str] = Field(
+        default=None,
+        description="Only the part of the user query that can be answered by the LLM without tools."
+    )
+
+
+async def init_question_router(state: GraphState):
+    """
+    Creates the routing chain. Uses tool descriptions to help the LLM decide.
+    """
+    llm = get_llm(stream=False)
+
+    tools = await get_tools_for_agent(state)
+    tools_description = render_text_description(tools)
+
+    # IMPORTANT: we force strict JSON output that matches RouteQuery
+    parser = PydanticOutputParser(pydantic_object=RouteQuery)
+    format_instructions = parser.get_format_instructions()
+
+    system = f"""
+You are an expert router that decides how to process a user request.
+
+You MUST output ONLY valid JSON matching this schema:
+{format_instructions}
+
+Available tools:
+{tools_description}
+
+Rules:
+1) If ANY part of the question requires tool data (e.g., CVE lookup, application details, SAST/DAST, internal systems),
+   then set datasource = "AGENT_WITH_TOOLS" and put ONLY that part into "tool_question".
+2) If part of the question is general knowledge (e.g., "capital of Ireland"), put ONLY that part into "general_question".
+3) If both exist, include BOTH fields. In that case datasource should still be "AGENT_WITH_TOOLS".
+4) If no tool is needed:
+   - Use RETRIEVE if the user is asking about knowledgebase/docs and context must be fetched
+   - Else use GENERATE
+5) "tools_needed" should be a small integer estimate (0 if none). If datasource is AGENT_WITH_TOOLS, set at least 1.
+
+Examples:
+
+User: "Give me CVE-2024-1234 and what is the capital of Ireland?"
+Output:
+{{
+  "datasource": "AGENT_WITH_TOOLS",
+  "tools_needed": 1,
+  "tool_question": "Give me CVE-2024-1234",
+  "general_question": "What is the capital of Ireland?"
+}}
+
+User: "What is the capital of Ireland?"
+Output:
+{{
+  "datasource": "GENERATE",
+  "tools_needed": 0,
+  "tool_question": null,
+  "general_question": "What is the capital of Ireland?"
+}}
+""".strip()
+
+    route_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system),
+            ("human", "{question}"),
+        ]
+    )
+
+    # Model call will return a message; parser runs on top.
+    question_router = route_prompt | llm
+    return question_router, parser
+
+
+async def route_question(state: GraphState) -> GraphState:
+    """
+    This node:
+    - reads state["question"]
+    - uses the LLM to decide datasource
+    - if the query is mixed, splits into tool_question + general_question
+    - sets state so tool-flow sees ONLY tool_question (keeps tool-executor clean)
+    """
+    logger.info("Graph State (incoming): %s", state)
+
+    # If already ended, do nothing
+    if state.get("next_step") == END:
+        return state
+
+    question = state.get("question")
+    if not question:
+        logger.warning("No 'question' found in state; routing to GENERATE as fallback.")
+        state["next_step"] = GENERATE
+        state["tools_required"] = 0
+        # prevent KeyError later
+        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
+        return state
+
+    logger.info("---ROUTE QUESTION---")
+    logger.info("User question: %s", question)
+
+    question_router, parser = await init_question_router(state)
+
+    # invoke router
+    response_msg = question_router.invoke({"question": question})
+    logger.info("Router raw response: %s", response_msg)
+
+    # parse structured result
+    try:
+        source: RouteQuery = await parser.ainvoke(response_msg)
+    except Exception as e:
+        logger.exception("Failed to parse router output into RouteQuery. Error=%s", e)
+        # fallback: treat as normal generate
+        state["next_step"] = GENERATE
+        state["tools_required"] = 0
+        state["general_question"] = question
+        state["tool_question"] = None
+        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
+        return state
+
+    logger.info("Router parsed result: %s", source)
+
+    tool_q = (source.tool_question or "").strip()
+    gen_q = (source.general_question or "").strip()
+
+    # Persist split questions
+    state["tool_question"] = tool_q or None
+    state["general_question"] = gen_q or None
+    state["has_general_question"] = bool(gen_q)
+    state["has_tool_question"] = bool(tool_q)
+
+    # The KEY idea:
+    # If tool_q exists => set state["question"] to tool_q so tool-flow executes ONLY tool stuff.
+    # general_question remains stored for GENERATE later.
+    if tool_q:
+        state["question"] = tool_q
+        state["next_step"] = AGENT_WITH_TOOLS
+        state["tools_required"] = max(int(source.tools_needed or 0), 1)
+        # keep a safe default so generate step never KeyErrors later
+        state.setdefault("generate_prompt_key", "SYNTHESIZE_NON_TEMPLATED_TOOL_OUTPUT")
+    else:
+        # No tools, run what router decided (RETRIEVE or GENERATE)
+        state["question"] = gen_q or question
+        state["next_step"] = source.datasource if source.datasource in (RETRIEVE, GENERATE, PDF_EXTRACT_INFO) else GENERATE
+        state["tools_required"] = 0
+        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
+
+    # Keep router output in messages for traceability (optional; matches your existing style)
+    # NOTE: If your graph expects messages to accumulate, LangGraph will merge.
+    return {
+        "messages": [response_msg],
+        "next_step": state["next_step"],
+        "tools_required": state.get("tools_required", 0),
+        "tool_question": state.get("tool_question"),
+        "general_question": state.get("general_question"),
+        "has_general_question": state.get("has_general_question", False),
+        "has_tool_question": state.get("has_tool_question", False),
+        "question": state.get("question"),
+        "generate_prompt_key": state.get("generate_prompt_key"),
+    }
+
