@@ -1,42 +1,203 @@
-import traceback
 import json
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-logger.info("=== DEBUG: about to append synth_context message ===")
-logger.info("messages type=%s", type(messages))
-logger.info("state['messages'] type=%s", type(state.get("messages")))
-logger.info("messages len=%s", len(messages) if hasattr(messages, "__len__") else "N/A")
+# Update these imports to match your project paths.
+from cstgenai_rag.executors.tool_executor import SimpleMCPAgent
 
-if isinstance(messages, list) and messages:
-    logger.info("messages[0] type=%s", type(messages[0]))
-    logger.info("messages[-1] type=%s", type(messages[-1]))
-    # LangChain objects often have .type
-    logger.info("messages[-1].type=%s", getattr(messages[-1], "type", None))
 
-# Step A: isolate JSON serialization errors
-try:
-    payload_text = json.dumps(synth_context, indent=2)
-    logger.info("json.dumps succeeded. payload length=%d", len(payload_text))
-except Exception as e:
-    logger.error("json.dumps FAILED: %s", e, exc_info=True)
-    # Make it succeed so you can move on
-    payload_text = json.dumps(synth_context, indent=2, default=str)
-    logger.info("json.dumps with default=str succeeded. payload length=%d", len(payload_text))
+@pytest.mark.asyncio
+async def test_execute_tools_template_found_routes_to_aggregate(monkeypatch):
+    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
 
-# Step B: isolate AIMessage construction errors
-try:
-    test_msg = AIMessage(content=payload_text)
-    logger.info("AIMessage construction OK. type=%s", type(test_msg))
-except Exception as e:
-    logger.error("AIMessage construction FAILED: %s", e, exc_info=True)
-    raise  # re-raise so you see the full stack trace
+    # Minimal fields used by execute_tools
+    agent.client = MagicMock()
+    agent.template_renderer = MagicMock()
+    agent.template_renderer.render_template.return_value = "TEMPLATED OUTPUT"
+    agent.tools = ["dummy"]  # whatever your code expects
 
-# Step C: isolate list concatenation / state assignment errors
-try:
-    test_new_messages = messages + [test_msg]
-    logger.info("messages + [AIMessage] OK. new_len=%d", len(test_new_messages))
-except Exception as e:
-    logger.error("messages + [AIMessage] FAILED: %s", e, exc_info=True)
-    raise
+    # Fake async session context
+    class FakeSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, exc_type, exc, tb): return False
 
-logger.info("=== DEBUG: append checks passed; doing assignment now ===")
-state["messages"] = test_new_messages
+    agent.client.session.return_value = FakeSession()
+
+    # Mock tool execution outcome: tool message has `template_name`
+    # (Adjust keys to match your tool output schema)
+    tool_payload = {
+        "template_name": "fetch_application_details.md",
+        "tool_response": {"data": {"a": 1}},
+    }
+
+    # If your code calls ToolNode.ainvoke(), patch that here.
+    # We'll patch your module function/class that produces the tool result.
+    # You may need to update the path based on your actual implementation.
+
+    async def fake_invoke(_):
+        # emulate result containing messages with a ToolMessage
+        return {
+            "messages": [
+                ToolMessage(content=json.dumps(tool_payload), tool_call_id="call_1")
+            ]
+        }
+
+    # Patch the internal "tool node" creation to return object with ainvoke
+    fake_tool_node = MagicMock()
+    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
+
+    # Patch wherever your code builds tool node; common names: ToolNode, tool_node, etc.
+    # Change "cstgenai_rag.executors.tool_executor.ToolNode" if needed.
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.ToolNode",
+        lambda tools: fake_tool_node
+    )
+
+    # Patch load_mcp_tools if your code calls it
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
+        AsyncMock(return_value=["t1", "t2"])
+    )
+
+    state = {
+        "messages": [HumanMessage(content="what is app 74563?")],
+        "successful_tools": 0,
+        "tools_required": 1,
+        "generate_prompt_key": None,
+    }
+
+    out = await agent.execute_tools(state=state, session_name="s")
+    assert out["templated_output"] == "TEMPLATED OUTPUT"
+    assert out["next_step"] in ("AGGREGATE", "aggregate")  # depends on your constant
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_template_missing_routes_to_generate_and_sets_prompt_key(monkeypatch):
+    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
+
+    agent.client = MagicMock()
+    agent.template_renderer = MagicMock()
+    agent.tools = ["dummy"]
+
+    class FakeSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, exc_type, exc, tb): return False
+
+    agent.client.session.return_value = FakeSession()
+
+    # Tool output with NO template name (or template missing flag)
+    tool_payload = {
+        "template_name": None,
+        "tool_name": "fetch_application_details",
+        "tool_response": {"data": {"some": "dict"}},
+        "reason": "template_not_found",
+    }
+
+    async def fake_invoke(_):
+        return {
+            "messages": [
+                ToolMessage(content=json.dumps(tool_payload), tool_call_id="call_1")
+            ]
+        }
+
+    fake_tool_node = MagicMock()
+    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
+
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.ToolNode",
+        lambda tools: fake_tool_node
+    )
+
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
+        AsyncMock(return_value=["t1"])
+    )
+
+    state = {
+        "messages": [HumanMessage(content="what is app 74563?")],
+        "successful_tools": 0,
+        "tools_required": 1,
+        "generate_prompt_key": None,
+    }
+
+    out = await agent.execute_tools(state=state, session_name="s")
+    assert out["next_step"] in ("GENERATE", "generate")
+
+    # Must be set (your KeyError fix)
+    assert out.get("generate_prompt_key")
+    # Make sure the last message is AIMessage and contains synth JSON
+    assert isinstance(out["messages"][-1], AIMessage)
+
+    # Validate it's JSON (because earlier you had json.dumps failures)
+    # out["messages"][-1].content should be valid JSON text
+    parsed = json.loads(out["messages"][-1].content)
+    assert "Instruction" in parsed or "instruction" in parsed
+    assert any(k in parsed for k in ("non_templated_tool_result", "non_templated_tool_results", "non_templated_tool_result"))
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_json_safe_when_tool_contains_set(monkeypatch):
+    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
+
+    agent.client = MagicMock()
+    agent.template_renderer = MagicMock()
+    agent.tools = ["dummy"]
+
+    class FakeSession:
+        async def __aenter__(self): return self
+        async def __aexit__(self, exc_type, exc, tb): return False
+
+    agent.client.session.return_value = FakeSession()
+
+    # Contains a set -> would break json.dumps unless default=str or sanitize is used
+    tool_payload = {
+        "template_name": None,
+        "tool_name": "fetch_application_details",
+        "tool_response": {"data": {"bad": {"a", "b"}}},  # set here
+        "reason": "template_not_found",
+    }
+
+    async def fake_invoke(_):
+        return {"messages": [ToolMessage(content=json.dumps(tool_payload, default=str), tool_call_id="call_1")]}
+
+    fake_tool_node = MagicMock()
+    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
+
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.ToolNode",
+        lambda tools: fake_tool_node
+    )
+
+    monkeypatch.setattr(
+        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
+        AsyncMock(return_value=["t1"])
+    )
+
+    state = {
+        "messages": [HumanMessage(content="Q")],
+        "successful_tools": 0,
+        "tools_required": 1,
+        "generate_prompt_key": None,
+    }
+
+    out = await agent.execute_tools(state=state, session_name="s")
+    assert out["next_step"] in ("GENERATE", "generate")
+    assert isinstance(out["messages"][-1], AIMessage)
+
+    # Must be parseable JSON
+    json.loads(out["messages"][-1].content)
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_when_already_all_tools_done_returns_state_unchanged():
+    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
+
+    state = {
+        "tools_required": 2,
+        "successful_tools": 2,
+        "messages": [HumanMessage(content="Q")],
+    }
+
+    out = await agent.execute_tools(state=state, session_name="s")
+    assert out is state or out == state
