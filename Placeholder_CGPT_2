@@ -215,84 +215,82 @@ class SimpleMCPEAgent:
 
 
 
+
+
+import logging
+
+from cstgenai_common_entities.model.consts import LAST, AGGREGATE
+from cstgenai_common_entities.model.prompt import Prompt
+from langchain_core.messages import AIMessage
+from langgraph.constants import END
+
+from cstgenai_rag.llm_client import get_llm
+from cstgenai_rag.model.state import GraphState
+from cstgenai_rag.support.db import get_repository_manager
+
+llm = get_llm(stream=False)
+logger = logging.getLogger(__name__)
+
+
 def synthesise_response(state: GraphState) -> GraphState:
     logger.info("=== GENERATE NODE ===")
-
     last_stage_data = state.get("last_stage_data")
     messages = state.get("messages", [])
 
     tool_answer = (state.get("tool_answer") or "").strip()
     general_question = (state.get("general_question") or "").strip()
 
-    logger.info(f"tool_answer: {tool_answer}")
-    logger.info(f"general_question: {general_question}")
-
-    llm = get_llm(stream=False)
+    logger.info(f"[GENERATE] tool_answer: {tool_answer}")
+    logger.info(f"[GENERATE] general_question: {general_question}")
 
     # -----------------------------------------------------------
-    # CASE 1: TOOL + GENERAL → STITCH BOTH ANSWERS
+    # CASE 1: TOOL + GENERAL  →  GENERATE produces partial stitched draft
     # -----------------------------------------------------------
     if tool_answer and general_question:
-        logger.info("Case: Tool answer + general question → stitched response")
+        logger.info("[GENERATE] Case: Tool + General")
 
-        prompt = f"""
-You have two inputs:
-1. Tool-derived result (already correct and factual)
-2. A general question that must be answered by reasoning
-
-Tool Result:
+        partial_output = f"""
+# Tool Result
 {tool_answer}
 
-General Question:
+# General Question
 {general_question}
-
-Return a single coherent answer that presents both results clearly.
-Label the sections as "Tool Result" and "General Answer".
 """.strip()
 
-        response = llm.invoke(prompt)
-
-        return {
-            "messages": [AIMessage(content=response.content)],
-            "next_step": END,
-            "last_stage_data": last_stage_data,
-            "final_answer": response.content,
-        }
+        # Store partial output for AGGREGATE to finalize
+        state["generate_partial"] = partial_output
+        state["next_step"] = AGGREGATE
+        return state
 
     # -----------------------------------------------------------
-    # CASE 2: ONLY GENERAL QUESTION → NORMAL GENERATE
+    # CASE 2: GENERAL ONLY
     # -----------------------------------------------------------
     if general_question and not tool_answer:
-        logger.info("Case: Only general question → direct LLM answer")
+        logger.info("[GENERATE] Case: General-only question")
 
         response = llm.invoke(general_question)
 
-        return {
-            "messages": [AIMessage(content=response.content)],
-            "next_step": END,
-            "last_stage_data": last_stage_data,
-            "final_answer": response.content,
-        }
+        # Pass LLM output to AGGREGATE
+        state["generate_partial"] = response.content
+        state["messages"] = [AIMessage(content=response.content)]
+        state["next_step"] = AGGREGATE
+        return state
 
     # -----------------------------------------------------------
-    # CASE 3: ONLY TOOL ANSWER (NO GENERAL PART)
+    # CASE 3: TOOL ONLY (NO GENERAL PART)
     # -----------------------------------------------------------
     if tool_answer and not general_question:
-        logger.info("Case: Only tool answer → return templated/raw tool output")
+        logger.info("[GENERATE] Case: Tool-only (forward to AGGREGATE)")
 
-        return {
-            "messages": [AIMessage(content=tool_answer)],
-            "next_step": END,
-            "last_stage_data": last_stage_data,
-            "final_answer": tool_answer,
-        }
+        state["generate_partial"] = tool_answer
+        state["next_step"] = AGGREGATE
+        return state
 
     # -----------------------------------------------------------
-    # CASE 4: NO SPLIT CASE → FALLBACK TO ORIGINAL BEHAVIOR
+    # CASE 4: FALLBACK (no split)
     # -----------------------------------------------------------
-    logger.info("Case: Fallback → use existing RAG/system prompt pipeline")
+    logger.info("[GENERATE] Case: fallback → use RAG system prompt")
 
-    # your existing mongo logic preserved
     prompt_key = state.get("generate_prompt_key")
     mongodb_manager = get_repository_manager()
     prompt_obj = mongodb_manager.prompt_repo.find_one(
@@ -305,12 +303,102 @@ Label the sections as "Tool Result" and "General Answer".
     )
 
     response = llm.invoke(prompt_message)
-    logger.info(f"Response from LLM: {response.content}")
+    logger.info(f"[GENERATE] Fallback Response: {response.content}")
 
-    return {
-        "messages": [AIMessage(content=response.content)],
-        "next_step": END,
-        "last_stage_data": last_stage_data,
-        "final_answer": response.content,
-    }
+    state["generate_partial"] = response.content
+    state["messages"] = [AIMessage(content=response.content)]
+    state["next_step"] = AGGREGATE
+    return state
+
+
+
+
+
+
+
+import logging
+from langchain_core.messages import AIMessage
+from langgraph.constants import END
+
+from cstgenai_rag.model.state import GraphState
+
+logger = logging.getLogger(__name__)
+
+
+def aggregate_node(state: GraphState) -> GraphState:
+    """
+    Final aggregation step.
+
+    Responsibilities:
+    - Merge tool_answer + general answer (if both)
+    - Clean final formatting
+    - Ensure ONE final AIMessage is returned
+
+    Always sets next_step = END.
+    """
+
+    logger.info("[AGGREGATE] Aggregating responses...")
+
+    tool_answer = (state.get("tool_answer") or "").strip()
+    general_question = (state.get("general_question") or "").strip()
+    generate_partial = (state.get("generate_partial") or "").strip()
+    templated_output = (state.get("templated_output") or "").strip() if state.get("templated_output") else None
+
+    logger.info(f"[AGGREGATE] tool_answer: {tool_answer}")
+    logger.info(f"[AGGREGATE] generate_partial: {generate_partial}")
+    logger.info(f"[AGGREGATE] templated_output: {templated_output}")
+
+    # -----------------------------------------------------------
+    # CASE 1: TOOL + GENERAL (final stitched output)
+    # -----------------------------------------------------------
+    if tool_answer and general_question:
+        logger.info("[AGGREGATE] Case: Tool + General → Final merge")
+
+        final_text = f"""
+### Tool Result
+{tool_answer}
+
+### General Answer
+{generate_partial}
+""".strip()
+
+        state["messages"] = [AIMessage(content=final_text)]
+        state["final_answer"] = final_text
+        state["next_step"] = END
+        return state
+
+    # -----------------------------------------------------------
+    # CASE 2: GENERAL-ONLY
+    # -----------------------------------------------------------
+    if not tool_answer and generate_partial:
+        logger.info("[AGGREGATE] Case: General-only")
+
+        state["messages"] = [AIMessage(content=generate_partial)]
+        state["final_answer"] = generate_partial
+        state["next_step"] = END
+        return state
+
+    # -----------------------------------------------------------
+    # CASE 3: TOOL-ONLY (templated or raw)
+    # -----------------------------------------------------------
+    if tool_answer and not general_question:
+        logger.info("[AGGREGATE] Case: Tool-only")
+
+        final_text = templated_output or tool_answer
+
+        state["messages"] = [AIMessage(content=final_text)]
+        state["final_answer"] = final_text
+        state["next_step"] = END
+        return state
+
+    # -----------------------------------------------------------
+    # CASE 4: Nothing? → fallback
+    # -----------------------------------------------------------
+    logger.warning("[AGGREGATE] No valid content found; returning empty output.")
+
+    fallback = "I could not construct a final response due to missing data."
+    state["messages"] = [AIMessage(content=fallback)]
+    state["final_answer"] = fallback
+    state["next_step"] = END
+    return state
 
