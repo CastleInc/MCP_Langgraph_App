@@ -1,0 +1,95 @@
+import logging
+from typing import Literal, Optional, get_args
+
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+
+# import these from your project (names based on your screenshots)
+# from ...common.llm import get_llm
+# from ...tools.registry import get_tools_for_agent
+# from langchain_core.tools import render_text_description
+# from ...workflow.constants import RETRIEVE, GENERATE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO
+# from ...workflow.state import GraphState
+
+logger = logging.getLogger(__name__)
+
+DatasourceType = Literal["RETRIEVE", "GENERATE", "AGENT_WITH_TOOLS", "PDF_EXTRACT_INFO"]
+
+
+class RouteQuery(BaseModel):
+    """
+    Router output schema.
+
+    datasource:
+      - AGENT_WITH_TOOLS: use MCP tools
+      - RETRIEVE: use vector store/docs retrieval
+      - GENERATE: general LLM answer
+      - PDF_EXTRACT_INFO: file-based extraction (if you have it)
+    """
+    datasource: DatasourceType = Field(description="Choose where to route the user query.")
+    tools_needed: int = Field(default=0, description="How many tool calls are needed (0 if none).")
+    tool_part: Optional[str] = Field(
+        default=None,
+        description="Only the part of the user query that MUST be solved via tools.",
+    )
+    generate_part: Optional[str] = Field(
+        default=None,
+        description="Only the part of the user query that can be answered without tools.",
+    )
+
+
+def _escape_curly_braces(text: str) -> str:
+    """
+    ChatPromptTemplate uses `{var}` formatting.
+    Any literal `{` or `}` in tool descriptions / JSON examples must be escaped to `{{` and `}}`
+    otherwise LangChain thinks they are prompt variables.
+    """
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+async def init_question_router(state: "GraphState"):
+    llm = get_llm(stream=False)
+
+    tools = await get_tools_for_agent(state)
+    tools_description = render_text_description(tools)
+
+    # CRITICAL: tools_description often contains JSON/dicts like { ... } which breaks ChatPromptTemplate
+    tools_description = _escape_curly_braces(tools_description)
+
+    options = " | ".join(get_args(DatasourceType))
+
+    system = f"""
+You are an expert at routing and splitting a user question.
+
+Return STRICT JSON ONLY (no markdown, no extra text).
+
+You MUST output a JSON object with exactly these keys:
+- datasource: one of [{options}]
+- tools_needed: integer (0 if none)
+- tool_part: string or null
+- generate_part: string or null
+
+Available tools:
+{tools_description}
+
+Rules:
+1) If ANY part of the question needs tools, set datasource = "AGENT_WITH_TOOLS".
+   Put ONLY the tool-requiring part into tool_part.
+2) If the question ALSO contains a direct/general question (e.g., "capital of Ireland"),
+   put ONLY that part into generate_part.
+3) If nothing needs tools:
+   - Use "GENERATE" if it's general knowledge.
+   - Use "RETRIEVE" if it requires searching internal docs/KB.
+4) tools_needed should be the number of tool calls you expect (0 if none).
+5) Keep tool_part and generate_part short, clean, and user-readable.
+""".strip()
+
+    route_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system),
+            ("human", "{question}"),
+        ]
+    )
+
+    question_router = route_prompt | llm
+    return question_router
