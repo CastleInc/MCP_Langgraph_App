@@ -1,203 +1,122 @@
-import json
-import pytest
-from unittest.mock import AsyncMock, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from typing import Literal, Optional
+from pydantic import BaseModel, Field
+from cstgenai_common_entities.model import RETRIEVE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO, GENERATE
 
-# Update these imports to match your project paths.
-from cstgenai_rag.executors.tool_executor import SimpleMCPAgent
+DatasourceType = Literal[RETRIEVE, GENERATE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO]
 
+class RouteQuery(BaseModel):
+    """
+    Route a user query to the most relevant datasource,
+    and (optionally) split mixed-intent questions into tool_part + generate_part.
+    """
+    datasource: DatasourceType = Field(
+        description="First step to run. If tool_part exists choose AGENT_WITH_TOOLS."
+    )
+    tools_needed: int = 0
 
-@pytest.mark.asyncio
-async def test_execute_tools_template_found_routes_to_aggregate(monkeypatch):
-    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
-
-    # Minimal fields used by execute_tools
-    agent.client = MagicMock()
-    agent.template_renderer = MagicMock()
-    agent.template_renderer.render_template.return_value = "TEMPLATED OUTPUT"
-    agent.tools = ["dummy"]  # whatever your code expects
-
-    # Fake async session context
-    class FakeSession:
-        async def __aenter__(self): return self
-        async def __aexit__(self, exc_type, exc, tb): return False
-
-    agent.client.session.return_value = FakeSession()
-
-    # Mock tool execution outcome: tool message has `template_name`
-    # (Adjust keys to match your tool output schema)
-    tool_payload = {
-        "template_name": "fetch_application_details.md",
-        "tool_response": {"data": {"a": 1}},
-    }
-
-    # If your code calls ToolNode.ainvoke(), patch that here.
-    # We'll patch your module function/class that produces the tool result.
-    # You may need to update the path based on your actual implementation.
-
-    async def fake_invoke(_):
-        # emulate result containing messages with a ToolMessage
-        return {
-            "messages": [
-                ToolMessage(content=json.dumps(tool_payload), tool_call_id="call_1")
-            ]
-        }
-
-    # Patch the internal "tool node" creation to return object with ainvoke
-    fake_tool_node = MagicMock()
-    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
-
-    # Patch wherever your code builds tool node; common names: ToolNode, tool_node, etc.
-    # Change "cstgenai_rag.executors.tool_executor.ToolNode" if needed.
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.ToolNode",
-        lambda tools: fake_tool_node
+    # NEW: split fields
+    tool_part: Optional[str] = Field(
+        default=None,
+        description="ONLY the sub-question(s) that require tools. Empty/null if none."
+    )
+    generate_part: Optional[str] = Field(
+        default=None,
+        description="ONLY the sub-question(s) that can be answered by the LLM directly. Empty/null if none."
     )
 
-    # Patch load_mcp_tools if your code calls it
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
-        AsyncMock(return_value=["t1", "t2"])
-    )
 
-    state = {
-        "messages": [HumanMessage(content="what is app 74563?")],
-        "successful_tools": 0,
-        "tools_required": 1,
-        "generate_prompt_key": None,
-    }
+system = f"""
+You are an expert at routing and splitting a user question.
 
-    out = await agent.execute_tools(state=state, session_name="s")
-    assert out["templated_output"] == "TEMPLATED OUTPUT"
-    assert out["next_step"] in ("AGGREGATE", "aggregate")  # depends on your constant
+You MUST return STRICT JSON ONLY (no markdown, no extra text) matching this schema:
+{{
+  "datasource": "{RETRIEVE}|{GENERATE}|{AGENT_WITH_TOOLS}|{PDF_EXTRACT_INFO}",
+  "tools_needed": 0,
+  "tool_part": null,
+  "generate_part": null
+}}
 
+Available tools:
+[
+{tools_description}
+]
 
-@pytest.mark.asyncio
-async def test_execute_tools_template_missing_routes_to_generate_and_sets_prompt_key(monkeypatch):
-    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
+Rules:
+1) If ANY part of the question needs tools, set datasource = "{AGENT_WITH_TOOLS}".
+   Put ONLY the tool-requiring part into "tool_part".
+2) If the question ALSO contains a direct/general question (e.g. "capital of Ireland"),
+   put ONLY that part into "generate_part".
+3) If nothing needs tools:
+   - Use "{GENERATE}" if it’s general knowledge.
+   - Use "{RETRIEVE}" if it requires searching internal docs/KB.
+4) "tools_needed" should be the number of tool calls you expect (0 if none).
+5) Keep tool_part and generate_part short, clean, and user-readable.
+"""
+from langchain_core.messages import HumanMessage
+from langchain.output_parsers import PydanticOutputParser
+from cstgenai_common_entities.model import END, GENERATE, AGENT_WITH_TOOLS
 
-    agent.client = MagicMock()
-    agent.template_renderer = MagicMock()
-    agent.tools = ["dummy"]
+async def route_question(state: GraphState) -> GraphState:
+    logger.info(msg="Graph State: %s", state)
 
-    class FakeSession:
-        async def __aenter__(self): return self
-        async def __aexit__(self, exc_type, exc, tb): return False
+    # if already ended, keep it
+    if state.get("next_step") == END:
+        return state
 
-    agent.client.session.return_value = FakeSession()
+    question_router = await init_question_router(state)
 
-    # Tool output with NO template name (or template missing flag)
-    tool_payload = {
-        "template_name": None,
-        "tool_name": "fetch_application_details",
-        "tool_response": {"data": {"some": "dict"}},
-        "reason": "template_not_found",
-    }
+    question = state["question"]
+    response = question_router.invoke({"question": question})
+    logger.info("Response from Question Router: %s", response)
 
-    async def fake_invoke(_):
-        return {
-            "messages": [
-                ToolMessage(content=json.dumps(tool_payload), tool_call_id="call_1")
-            ]
-        }
+    output_parser = PydanticOutputParser(pydantic_object=RouteQuery)
+    source: RouteQuery = await output_parser.ainvoke(response)
+    logger.info("Router parsed: %s", source)
 
-    fake_tool_node = MagicMock()
-    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
+    # --- store routing plan in state ---
+    state["tools_required"] = source.tools_needed or 0
+    state["pending_generate_part"] = (source.generate_part or "").strip() or None
+    state["tool_part"] = (source.tool_part or "").strip() or None
 
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.ToolNode",
-        lambda tools: fake_tool_node
-    )
+    # Decide first hop
+    next_step = source.datasource
 
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
-        AsyncMock(return_value=["t1"])
-    )
+    # If we have tool_part, ALWAYS go to tools first
+    if state["tool_part"]:
+        next_step = AGENT_WITH_TOOLS
 
-    state = {
-        "messages": [HumanMessage(content="what is app 74563?")],
-        "successful_tools": 0,
-        "tools_required": 1,
-        "generate_prompt_key": None,
-    }
+        # Make tool agent see only tool_part as the latest user input
+        state["question"] = state["tool_part"]
+        state.setdefault("messages", [])
+        state["messages"].append(HumanMessage(content=state["tool_part"]))
 
-    out = await agent.execute_tools(state=state, session_name="s")
-    assert out["next_step"] in ("GENERATE", "generate")
+    else:
+        # no tools needed
+        state["question"] = question  # keep original
+        # If router says GENERATE, set a safe default prompt key
+        if next_step == GENERATE:
+            state.setdefault("generate_prompt_key", "DEFAULT_PROMPT")
 
-    # Must be set (your KeyError fix)
-    assert out.get("generate_prompt_key")
-    # Make sure the last message is AIMessage and contains synth JSON
-    assert isinstance(out["messages"][-1], AIMessage)
-
-    # Validate it's JSON (because earlier you had json.dumps failures)
-    # out["messages"][-1].content should be valid JSON text
-    parsed = json.loads(out["messages"][-1].content)
-    assert "Instruction" in parsed or "instruction" in parsed
-    assert any(k in parsed for k in ("non_templated_tool_result", "non_templated_tool_results", "non_templated_tool_result"))
+    state["next_step"] = next_step
+    return state
 
 
-@pytest.mark.asyncio
-async def test_execute_tools_json_safe_when_tool_contains_set(monkeypatch):
-    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
 
-    agent.client = MagicMock()
-    agent.template_renderer = MagicMock()
-    agent.tools = ["dummy"]
+from langchain_core.messages import HumanMessage
+from cstgenai_common_entities.model import GENERATE, AGGREGATE
 
-    class FakeSession:
-        async def __aenter__(self): return self
-        async def __aexit__(self, exc_type, exc, tb): return False
+pending = state.get("pending_generate_part")
 
-    agent.client.session.return_value = FakeSession()
+if pending:
+    state.setdefault("messages", [])
+    state["messages"].append(HumanMessage(content=pending))
+    state["question"] = pending
 
-    # Contains a set -> would break json.dumps unless default=str or sanitize is used
-    tool_payload = {
-        "template_name": None,
-        "tool_name": "fetch_application_details",
-        "tool_response": {"data": {"bad": {"a", "b"}}},  # set here
-        "reason": "template_not_found",
-    }
+    # pick the right prompt key for direct/general question answering
+    state["generate_prompt_key"] = state.get("generate_prompt_key") or "DEFAULT_PROMPT"
 
-    async def fake_invoke(_):
-        return {"messages": [ToolMessage(content=json.dumps(tool_payload, default=str), tool_call_id="call_1")]}
+    state["next_step"] = GENERATE
+else:
+    # no remaining direct question, go aggregate
+    state["next_step"] = AGGREGATE
 
-    fake_tool_node = MagicMock()
-    fake_tool_node.ainvoke = AsyncMock(side_effect=fake_invoke)
-
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.ToolNode",
-        lambda tools: fake_tool_node
-    )
-
-    monkeypatch.setattr(
-        "cstgenai_rag.executors.tool_executor.load_mcp_tools",
-        AsyncMock(return_value=["t1"])
-    )
-
-    state = {
-        "messages": [HumanMessage(content="Q")],
-        "successful_tools": 0,
-        "tools_required": 1,
-        "generate_prompt_key": None,
-    }
-
-    out = await agent.execute_tools(state=state, session_name="s")
-    assert out["next_step"] in ("GENERATE", "generate")
-    assert isinstance(out["messages"][-1], AIMessage)
-
-    # Must be parseable JSON
-    json.loads(out["messages"][-1].content)
-
-
-@pytest.mark.asyncio
-async def test_execute_tools_when_already_all_tools_done_returns_state_unchanged():
-    agent = SimpleMCPAgent.__new__(SimpleMCPAgent)
-
-    state = {
-        "tools_required": 2,
-        "successful_tools": 2,
-        "messages": [HumanMessage(content="Q")],
-    }
-
-    out = await agent.execute_tools(state=state, session_name="s")
-    assert out is state or out == state
