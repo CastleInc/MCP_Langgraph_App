@@ -1,404 +1,176 @@
-class SimpleMCPEAgent:
-    async def execute_tools(self, state: GraphState, session_name: str) -> GraphState:
-        """
-        Execute tools using the provided state and return the updated state.
-        """
-
-        logger.info("=== EXECUTE TOOLS NODE ===")
-
-        messages = state.get("messages", [])
-        # IMPORTANT: Use tool_question first (not the whole original question)
-        question = (state.get("tool_question") or state.get("question", "")).strip()
-
-        has_rag_data = False
-        state.setdefault("tool_responses", {})
-        state.setdefault("templated_output", None)
-        state.setdefault("template_used", None)
-        state.setdefault("tool_answer", None)       # <-- NEW FOR MULTI-PART FLOW
-        state.setdefault("general_question", None)  # <-- Should already be set by router
-
-        successful_tools = state.get("successful_tools", [])
-        tools_required = state.get("tools_required", 0)
-
-        logger.info(f"Tool question (slice): {question}")
-        logger.info(f"General question slice: {state.get('general_question')}")
-
-        # If there is NO tool question but general exists → skip tools entirely
-        if not question:
-            logger.info("No tool slice. Skipping tool execution.")
-            if (state.get("general_question") or "").strip():
-                state["next_step"] = GENERATE
-                return state
-            # else follow original fallback
-            state["next_step"] = RETRIEVE
-            return state
-
-        # -------------------------
-        # Execute tool through MCP
-        # -------------------------
-        try:
-            async with self.client.session(session_name) as session:
-                self.tools = await load_mcp_tools(session)
-                logger.info(f"Loaded MCP tools: {self.tools}")
-
-                tool_node = ToolNode(tools=self.tools)
-                logger.info(f"ToolNode created with tools: {self.tools}")
-
-                result = await tool_node.ainvoke(question)
-                logger.info(f"Tool execution result: {result}")
-
-                messages = [
-                    msg for msg in reversed(messages)
-                    if hasattr(msg, "type") and msg.type == "tool"
-                ]
-                messages += result["messages"]
-
-                tool_messages = [
-                    msg for msg in messages if msg.type == "tool"
-                ]
-
-                # -----------------------------
-                # Case: Tool produced NO output
-                # -----------------------------
-                if not tool_messages:
-                    logger.warning("Tool messages empty after tool execution")
-                    state["tool_answer"] = None
-
-                    if (state.get("general_question") or "").strip():
-                        state["next_step"] = GENERATE
-                        return state
-
-                    state["next_step"] = RETRIEVE
-                    return state
-
-                # -----------------------------
-                # Gather tool response payloads
-                # -----------------------------
-                rendered_outputs = []
-                templates_used = []
-                non_templated_payloads = []
-
-                for tool_msg in tool_messages:
-                    tool_name = getattr(tool_msg, "name", "unknown")
-                    content = getattr(tool_msg, "content", None)
-
-                    if not content:
-                        logger.warning(f"No content for tool: {tool_name}")
-                        continue
-
-                    # JSON deserialize
-                    try:
-                        tool_response = json.loads(content)
-                    except Exception:
-                        logger.error("JSON decode failed for tool response")
-                        non_templated_payloads.append(
-                            {"tool_name": tool_name, "tool_response": content}
-                        )
-                        continue
-
-                    has_rag_data = bool(tool_response.get("has_context", False))
-
-                    # Handle templated paths
-                    data_block = tool_response.get("data")
-                    template_name = f"{tool_name}_unknown.md"
-
-                    if isinstance(data_block, dict) and "template_name" in data_block:
-                        template_name = data_block["template_name"]
-
-                    # Render Jinja template if available
-                    try:
-                        template_renderer = get_jinja_renderer()
-                        rendered = template_renderer.render_template(
-                            template_name,
-                            data_block,
-                        )
-                        rendered_output = rendered.strip()
-                        rendered_outputs.append(rendered_output)
-                        templates_used.append(template_name)
-                    except Exception as e:
-                        logger.error(
-                            f"Error rendering template {template_name}: {e}"
-                        )
-                        non_templated_payloads.append(
-                            {"tool_name": tool_name, "tool_response": tool_response}
-                        )
-
-                # ============================================================
-                # =============== TEMPLATED TOOL RESPONSE ====================
-                # ============================================================
-
-                if rendered_outputs and not non_templated_payloads:
-                    combined = "\n".join(rendered_outputs).strip()
-                    state["templated_output"] = combined
-                    state["template_used"] = (
-                        ", ".join(templates_used) if templates_used else None
-                    )
-                    state["tool_answer"] = combined     # <-- REQUIRED
-
-                    logger.info("TEMPLATED tool output created.")
-
-                    # If general part exists → go to GENERATE
-                    if (state.get("general_question") or "").strip():
-                        state["next_step"] = GENERATE
-                        state["last_stage_data"] = ToolResponse(
-                            data=combined,
-                            success=True,
-                            metadata={"sources": ["tools"]},
-                            has_context=has_rag_data,
-                            next_action=GENERATE,
-                            info="templated tool response + pending general question",
-                            template=state["template_used"],
-                        )
-                        return state
-
-                    # Tool-only case → go to AGGREGATE
-                    state["next_step"] = AGGREGATE
-                    state["last_stage_data"] = ToolResponse(
-                        data=combined,
-                        success=True,
-                        metadata={"sources": ["tools"]},
-                        has_context=has_rag_data,
-                        next_action=AGGREGATE,
-                        info="templated tool response",
-                        template=state["template_used"],
-                    )
-                    return state
-
-                # ============================================================
-                # ========= NON-TEMPLATED TOOL RESPONSE (template missing) ===
-                # ============================================================
-
-                raw_answers = [
-                    f"{p['tool_name']}: {p['tool_response']}"
-                    for p in non_templated_payloads
-                ]
-                combined_raw = "\n".join(raw_answers).strip()
-                state["tool_answer"] = combined_raw
-
-                logger.info("NON-TEMPLATED tool output created.")
-
-                # Has general part → go to GENERATE
-                if (state.get("general_question") or "").strip():
-                    state["next_step"] = GENERATE
-                    state["last_stage_data"] = ToolResponse(
-                        data=combined_raw,
-                        success=True,
-                        metadata={"sources": ["tools"]},
-                        has_context=has_rag_data,
-                        next_action=GENERATE,
-                        info="non-templated tool response + pending general question",
-                    )
-                    return state
-
-                # Tool only → go AGGREGATE
-                state["next_step"] = AGGREGATE
-                state["last_stage_data"] = ToolResponse(
-                    data=combined_raw,
-                    success=True,
-                    metadata={"sources": ["tools"]},
-                    has_context=has_rag_data,
-                    next_action=AGGREGATE,
-                    info="non-templated tool response",
-                )
-                return state
-
-        except Exception as e:
-            logger.error(f"Exception during tool execution: {e}")
-            state["tool_answer"] = None
-            state["next_step"] = RETRIEVE
-            return state
-
-
-
-
-
-
-
-
-
-
-import logging
-
-from cstgenai_common_entities.model.consts import LAST, AGGREGATE
-from cstgenai_common_entities.model.prompt import Prompt
-from langchain_core.messages import AIMessage
-from langgraph.constants import END
-
-from cstgenai_rag.llm_client import get_llm
-from cstgenai_rag.model.state import GraphState
-from cstgenai_rag.support.db import get_repository_manager
-
-llm = get_llm(stream=False)
-logger = logging.getLogger(__name__)
-
-
 def synthesise_response(state: GraphState) -> GraphState:
     logger.info("=== GENERATE NODE ===")
-    last_stage_data = state.get("last_stage_data")
+
+    llm = get_llm(stream=False)
     messages = state.get("messages", [])
 
     tool_answer = (state.get("tool_answer") or "").strip()
     general_question = (state.get("general_question") or "").strip()
 
-    logger.info(f"[GENERATE] tool_answer: {tool_answer}")
-    logger.info(f"[GENERATE] general_question: {general_question}")
+    logger.info(f"[GENERATE] tool_answer={tool_answer}")
+    logger.info(f"[GENERATE] general_question={general_question}")
 
     # -----------------------------------------------------------
-    # CASE 1: TOOL + GENERAL  →  GENERATE produces partial stitched draft
+    # CASE 1: Tool + General → stitch both
     # -----------------------------------------------------------
     if tool_answer and general_question:
-        logger.info("[GENERATE] Case: Tool + General")
+        logger.info("Case: Tool + General → Stitch in GENERATE")
 
-        partial_output = f"""
-# Tool Result
+        stitched = f"""
+Tool Result:
 {tool_answer}
 
-# General Question
+General Question:
 {general_question}
+
+Provide a combined, well-structured answer containing BOTH results.
 """.strip()
 
-        # Store partial output for AGGREGATE to finalize
-        state["generate_partial"] = partial_output
-        state["next_step"] = AGGREGATE
-        return state
+        response = llm.invoke(stitched)
+
+        # DO NOT END HERE — go to AGGREGATE
+        return {
+            "messages": [AIMessage(content=response.content)],
+            "next_step": AGGREGATE,
+            "last_stage_data": state.get("last_stage_data"),
+            "final_generate_output": response.content
+        }
 
     # -----------------------------------------------------------
-    # CASE 2: GENERAL ONLY
+    # CASE 2: Only general
     # -----------------------------------------------------------
     if general_question and not tool_answer:
-        logger.info("[GENERATE] Case: General-only question")
+        logger.info("Case: Only General Question → Normal generate")
 
         response = llm.invoke(general_question)
 
-        # Pass LLM output to AGGREGATE
-        state["generate_partial"] = response.content
-        state["messages"] = [AIMessage(content=response.content)]
-        state["next_step"] = AGGREGATE
-        return state
+        return {
+            "messages": [AIMessage(content=response.content)],
+            "next_step": AGGREGATE,
+            "last_stage_data": state.get("last_stage_data"),
+            "final_generate_output": response.content
+        }
 
     # -----------------------------------------------------------
-    # CASE 3: TOOL ONLY (NO GENERAL PART)
+    # CASE 3: Only tool answer (templated or raw)
     # -----------------------------------------------------------
     if tool_answer and not general_question:
-        logger.info("[GENERATE] Case: Tool-only (forward to AGGREGATE)")
+        logger.info("Case: Tool Only → Forward to AGGREGATE")
 
-        state["generate_partial"] = tool_answer
-        state["next_step"] = AGGREGATE
-        return state
+        return {
+            "messages": [AIMessage(content=tool_answer)],
+            "next_step": AGGREGATE,
+            "last_stage_data": state.get("last_stage_data"),
+            "final_generate_output": tool_answer
+        }
 
     # -----------------------------------------------------------
-    # CASE 4: FALLBACK (no split)
+    # CASE 4: Fallback → original RAG path
     # -----------------------------------------------------------
-    logger.info("[GENERATE] Case: fallback → use RAG system prompt")
+    logger.info("Case: fallback RAG flow → GENERATE then AGGREGATE")
 
     prompt_key = state.get("generate_prompt_key")
-    mongodb_manager = get_repository_manager()
-    prompt_obj = mongodb_manager.prompt_repo.find_one(
-        filter_query={"key": prompt_key}
-    )
+    repo = get_repository_manager().prompt_repo
+    prompt_obj = repo.find_one(filter_query={"key": prompt_key})
 
-    prompt_message = (
-        f"""{prompt_obj.content if prompt_obj else "System Prompt"} 
-        Context: {messages}"""
-    )
+    prompt = f"""{prompt_obj.content if prompt_obj else "System Prompt"}
+Context: {messages}
+"""
 
-    response = llm.invoke(prompt_message)
-    logger.info(f"[GENERATE] Fallback Response: {response.content}")
+    response = llm.invoke(prompt)
 
-    state["generate_partial"] = response.content
-    state["messages"] = [AIMessage(content=response.content)]
-    state["next_step"] = AGGREGATE
-    return state
+    return {
+        "messages": [AIMessage(content=response.content)],
+        "next_step": AGGREGATE,
+        "last_stage_data": state.get("last_stage_data"),
+        "final_generate_output": response.content
+    }
 
-
-
-
-
-
-
-import logging
-from langchain_core.messages import AIMessage
-from langgraph.constants import END
-
-from cstgenai_rag.model.state import GraphState
-
-logger = logging.getLogger(__name__)
 
 
 def aggregate_node(state: GraphState) -> GraphState:
-    """
-    Final aggregation step.
+    logger.info("=== AGGREGATE NODE ===")
 
-    Responsibilities:
-    - Merge tool_answer + general answer (if both)
-    - Clean final formatting
-    - Ensure ONE final AIMessage is returned
+    msgs = list(state.get("messages", []))
+    generated_output = (state.get("final_generate_output") or "").strip()
+    templated_output = (state.get("templated_output") or "").strip()
 
-    Always sets next_step = END.
-    """
+    logger.info(f"[AGG] generated_output={generated_output}")
+    logger.info(f"[AGG] templated_output={templated_output}")
 
-    logger.info("[AGGREGATE] Aggregating responses...")
+    final_text = ""
 
-    tool_answer = (state.get("tool_answer") or "").strip()
-    general_question = (state.get("general_question") or "").strip()
-    generate_partial = (state.get("generate_partial") or "").strip()
-    templated_output = (state.get("templated_output") or "").strip() if state.get("templated_output") else None
+    # Case 1: Both templated and generated present
+    if templated_output and generated_output:
+        final_text = f"{templated_output}\n\n{generated_output}"
 
-    logger.info(f"[AGGREGATE] tool_answer: {tool_answer}")
-    logger.info(f"[AGGREGATE] generate_partial: {generate_partial}")
-    logger.info(f"[AGGREGATE] templated_output: {templated_output}")
+    # Case 2: Only generated present
+    elif generated_output:
+        final_text = generated_output
 
-    # -----------------------------------------------------------
-    # CASE 1: TOOL + GENERAL (final stitched output)
-    # -----------------------------------------------------------
-    if tool_answer and general_question:
-        logger.info("[AGGREGATE] Case: Tool + General → Final merge")
+    # Case 3: Only templated present
+    elif templated_output:
+        final_text = templated_output
 
-        final_text = f"""
-### Tool Result
-{tool_answer}
+    else:
+        logger.warning("[AGG] No templated or generated output found.")
+        final_text = "Unable to generate answer."
 
-### General Answer
-{generate_partial}
-""".strip()
-
-        state["messages"] = [AIMessage(content=final_text)]
-        state["final_answer"] = final_text
-        state["next_step"] = END
-        return state
-
-    # -----------------------------------------------------------
-    # CASE 2: GENERAL-ONLY
-    # -----------------------------------------------------------
-    if not tool_answer and generate_partial:
-        logger.info("[AGGREGATE] Case: General-only")
-
-        state["messages"] = [AIMessage(content=generate_partial)]
-        state["final_answer"] = generate_partial
-        state["next_step"] = END
-        return state
-
-    # -----------------------------------------------------------
-    # CASE 3: TOOL-ONLY (templated or raw)
-    # -----------------------------------------------------------
-    if tool_answer and not general_question:
-        logger.info("[AGGREGATE] Case: Tool-only")
-
-        final_text = templated_output or tool_answer
-
-        state["messages"] = [AIMessage(content=final_text)]
-        state["final_answer"] = final_text
-        state["next_step"] = END
-        return state
-
-    # -----------------------------------------------------------
-    # CASE 4: Nothing? → fallback
-    # -----------------------------------------------------------
-    logger.warning("[AGGREGATE] No valid content found; returning empty output.")
-
-    fallback = "I could not construct a final response due to missing data."
-    state["messages"] = [AIMessage(content=fallback)]
-    state["final_answer"] = fallback
+    # Final answer message
+    state["messages"] = [AIMessage(content=final_text)]
     state["next_step"] = END
+    state["final_answer"] = final_text
+
     return state
 
+
+
+
+
+
+
+def route_after_tool_agent(state: GraphState) -> str:
+    """
+    Decide next step after the TOOL_AGENT node.
+    Checks:
+        1. Whether a tool was invoked
+        2. Whether template exists
+        3. Whether general question exists
+    """
+
+    messages = state.get("messages", [])
+    last_message = messages[-1] if messages else None
+
+    # -----------------------------------------
+    # CASE 1: Tool was called by the agent
+    # -----------------------------------------
+    if last_message and hasattr(last_message, "tool_calls"):
+        logger.info("route_after_tool_agent: Tool calls detected in last_message")
+
+        # ALWAYS go to EXECUTE_TOOLS node
+        return ACT
+
+    # -----------------------------------------
+    # CASE 2: No tool call
+    # LLM responded with textual "let me check" etc.
+    # → Then route to RETRIEVE (existing behaviour)
+    # -----------------------------------------
+    if last_message and hasattr(last_message, "content"):
+        response_content = last_message.content.lower()
+
+        trigger_phrases = [
+            "need more information",
+            "would need to check",
+            "let me search",
+            "i’ll need to"
+        ]
+
+        if any(tp in response_content for tp in trigger_phrases):
+            logger.info("route_after_tool_agent: No tool call but LLM suggests RETRIEVE")
+            return RETRIEVE
+
+    # -----------------------------------------
+    # DEFAULT FALLBACK — No tool calls, no signals
+    # -----------------------------------------
+    logger.info("route_after_tool_agent: Defaulting to RETRIEVE")
+    return RETRIEVE
