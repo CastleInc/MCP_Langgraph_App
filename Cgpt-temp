@@ -342,3 +342,261 @@ Respond concisely but informatively.
         "vamp_similar_aits": vamp_similar_aits,
         "next_step": None,  # allow graph to terminate or continue as configured
     }
+
+
+
+
+
+
+
+
+
+
+
+
+import logging
+from typing import Literal, get_args
+
+from pydantic import BaseModel, Field
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.tools.render import render_text_description
+
+from cstgenai_rag.llm.llm_client import get_llm
+from cstgenai_rag.model.rag.state import GraphState
+from cstgenai_rag.tools.registry import get_tools_for_agent
+from cstgenai_rag.support.db import get_repository_manager
+
+logger = logging.getLogger(__name__)
+
+# The high-level routing targets
+DatasourceType = Literal["RETRIEVE", "AGENT_WITH_TOOLS", "PDF_EXTRACT_INFO"]
+
+
+class RouteQuery(BaseModel):
+    """Route a user query to the most relevant datasource."""
+
+    datasource: DatasourceType = Field(
+        description=(
+            "Given a user question choose to route it to one of: "
+            f"{', '.join(get_args(DatasourceType))}."
+        )
+    )
+    tools_needed: int = 0
+
+    # NEW: whether we should go into VAMP flow after GENERATE
+    vamp_intent: bool = False
+
+
+async def init_question_router(state: GraphState):
+    """
+    Build and return the LLM used for routing the user question.
+
+    The actual system prompt is stored in Mongo `prompts` collection and
+    selected based on product profile (COMMON vs PENPAL).
+
+    The prompt content is treated as a template and should contain the
+    placeholders:
+      - {options}
+      - {tools_description}
+      - {json_template}
+    """
+
+    llm = get_llm(stream=False)
+
+    # ---- Datasource options & tools description ----
+    options = " | ".join(get_args(RouteQuery.model_fields["datasource"].annotation))
+    tools = await get_tools_for_agent(state)
+    tools_description = render_text_description(tools)
+
+    # ---- JSON schema that the LLM must fill ----
+    # Make sure your Mongo prompt mentions to respond exactly as {json_template}
+    json_template = """
+{
+  "datasource": "<RETRIEVE|AGENT_WITH_TOOLS|PDF_EXTRACT_INFO>",
+  "options": ["optional", "tool", "names"],
+  "tools_needed": 0,
+  "vamp_intent": false
+}
+""".strip()
+
+    # ---- Determine product profile & prompt key ----
+    # Expect something like "COMMON" or "PENPAL" in state; default to COMMON.
+    product_profile = str(state.get("product_profile", "COMMON")).upper()
+
+    if product_profile == "PENPAL":
+        prompt_key = "PENPAL_ROUTER_PROMPT"
+    else:
+        prompt_key = "COMMON_ROUTER_PROMPT"
+
+    # ---- Fetch system prompt template from Mongo ----
+    repo_manager = get_repository_manager()
+    prompt_repo = repo_manager.prompt_repo
+
+    prompt_doc = prompt_repo.find_one({"key": prompt_key})
+    if prompt_doc:
+        base_system_template = prompt_doc.content
+        logger.info("Using router prompt from Mongo for key=%s", prompt_key)
+    else:
+        # Fallback: a simple built-in prompt if Mongo is misconfigured
+        logger.warning(
+            "Router prompt with key=%s not found in Mongo. "
+            "Using fallback inline system prompt.",
+            prompt_key,
+        )
+        base_system_template = (
+            "You are an expert at routing a user question to {options}.\n"
+            "Available tools:\n{tools_description}\n\n"
+            "Respond ONLY in JSON format as {json_template}."
+        )
+
+    # ---- Render final system prompt with dynamic values ----
+    # Your Mongo prompt content should use {options}, {tools_description},
+    # and {json_template} as Python format placeholders.
+    try:
+        system = base_system_template.format(
+            options=options,
+            tools_description=tools_description,
+            json_template=json_template,
+        )
+    except Exception:
+        # If formatting fails, log and fall back to raw content
+        logger.exception(
+            "Error formatting router prompt content for key=%s. "
+            "Falling back to unformatted content.",
+            prompt_key,
+        )
+        system = base_system_template
+
+    # ---- Build the router chain ----
+    route_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system),
+            ("human", "{question}"),
+        ]
+    )
+
+    question_router = route_prompt | llm
+    return question_router
+
+
+
+
+
+
+
+
+
+
+{
+  "key": "COMMON_ROUTER_PROMPT",
+  "content": "You are an expert at routing a user question to {options}...\n"
+             "Available tools:\n{tools_description}\n\n"
+             "...\n"
+             "Be concise and Respond only in JSON format as {json_template}."
+}
+
+
+{
+  "key": "PENPAL_ROUTER_PROMPT",
+  "content": "You are an expert at routing a user question for PenPal to {options}...\n"
+             "Available tools:\n{tools_description}\n\n"
+             "...\n"
+             "Be concise and Respond only in JSON format as {json_template}."
+}
+
+
+
+
+import logging
+import os
+from typing import List
+
+from langchain_core.messages import SystemMessage
+
+from cstgenai_rag.model.rag.state import GraphState
+from cstgenai_rag.model.rag.models import VectorStoreRequest
+from cstgenai_rag.support.db import get_vector_store_retriever
+
+logger = logging.getLogger(__name__)
+
+
+async def retrieve_vamp(state: GraphState) -> GraphState:
+    """
+    VAMP Retrieve node.
+    Identical to rag_retrieve, but adds a VAMP-specific system prompt.
+    No VAMP API calls are made here.
+    """
+
+    logger.info("--VAMP VECTOR STORE RETRIEVAL--")
+
+    messages = state["messages"]
+    metadata_filter = state.get("metadata_filter", {})
+    ai_messages = [msg for msg in messages if hasattr(msg, "type") and msg.type == "ai"]
+
+    # Attach previous AI answer as extra context
+    if ai_messages:
+        extra_content = ai_messages[-1].content
+    else:
+        extra_content = ""
+
+    question = state["question"] + "\n" + extra_content
+    payload = {"input": question}
+    logger.debug(f"Input passed to VAMP Retrieve payload: {payload}")
+
+    documents: List[str] = []
+    has_rag_data = False
+    generate_prompt_key = "VECTOR_DATA_ABSENT"
+
+    # -------------------------------------------
+    # SAME VECTOR STORE RETRIEVAL AS rag_retrieve
+    # -------------------------------------------
+    reranking_needed = os.getenv("LLM_RERANKING_ENABLED", "true").lower() == "true"
+
+    vector_store_request = VectorStoreRequest(
+        base_request=state["knowledgebase_request"],
+        filters=metadata_filter,
+        ranking_needed=reranking_needed,
+    )
+
+    rag_data = await get_vector_store_retriever().get_required_nodes(
+        vector_store_request
+    )
+
+    if rag_data and rag_data.data:
+        documents.append(rag_data.data.context)
+        has_rag_data = True
+        generate_prompt_key = "VECTOR_DATA_PRESENT"
+
+    # -------------------------------------------
+    # NEW: VAMP-SPECIFIC SYSTEM PROMPT
+    # -------------------------------------------
+    vamp_system_prompt = """
+You are a penetration testing assistant with enhanced VAMP intelligence.
+
+Use the user's question, previous assistant response, and vector store context
+to generate a highly actionable, testing-focused answer.
+
+You MUST:
+- Focus on "what to test" and "how to test" the application.
+- Highlight typical patterns pen testers follow in similar assessments.
+- Provide step-by-step, actionable recommendations.
+- Use vector store context if available.
+- DO NOT hallucinate tools or APIs that are not provided.
+
+Do NOT output JSON. Produce a natural-language answer.
+""".strip()
+
+    # -------------------------------------------
+    # SAME RETURN STRUCTURE AS rag_retrieve
+    # -------------------------------------------
+    return {
+        "documents": documents,
+        "messages": [SystemMessage(content=vamp_system_prompt)],
+        "next_step": None,  # Allow GENERATE to run after this
+        "generate_prompt_key": generate_prompt_key,
+        "has_rag_data": has_rag_data,
+        "last_stage_data": {
+            "rag_data": rag_data.data if rag_data else None
+        }
+    }
+
