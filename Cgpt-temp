@@ -1,231 +1,94 @@
-from typing import Literal, Optional
-from pydantic import BaseModel, Field
-from cstgenai_common_entities.model import RETRIEVE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO, GENERATE
-
-DatasourceType = Literal[RETRIEVE, GENERATE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO]
-
-class RouteQuery(BaseModel):
-    """
-    Route a user query to the most relevant datasource,
-    and (optionally) split mixed-intent questions into tool_part + generate_part.
-    """
-    datasource: DatasourceType = Field(
-        description="First step to run. If tool_part exists choose AGENT_WITH_TOOLS."
-    )
-    tools_needed: int = 0
-
-    # NEW: split fields
-    tool_part: Optional[str] = Field(
-        default=None,
-        description="ONLY the sub-question(s) that require tools. Empty/null if none."
-    )
-    generate_part: Optional[str] = Field(
-        default=None,
-        description="ONLY the sub-question(s) that can be answered by the LLM directly. Empty/null if none."
-    )
-
-
-system = f"""
-You are an expert at routing and splitting a user question.
-
-You MUST return STRICT JSON ONLY (no markdown, no extra text) matching this schema:
-{{
-  "datasource": "{RETRIEVE}|{GENERATE}|{AGENT_WITH_TOOLS}|{PDF_EXTRACT_INFO}",
-  "tools_needed": 0,
-  "tool_part": null,
-  "generate_part": null
-}}
-
-Available tools:
-[
-{tools_description}
-]
-
-Rules:
-1) If ANY part of the question needs tools, set datasource = "{AGENT_WITH_TOOLS}".
-   Put ONLY the tool-requiring part into "tool_part".
-2) If the question ALSO contains a direct/general question (e.g. "capital of Ireland"),
-   put ONLY that part into "generate_part".
-3) If nothing needs tools:
-   - Use "{GENERATE}" if it’s general knowledge.
-   - Use "{RETRIEVE}" if it requires searching internal docs/KB.
-4) "tools_needed" should be the number of tool calls you expect (0 if none).
-5) Keep tool_part and generate_part short, clean, and user-readable.
-"""
-from langchain_core.messages import HumanMessage
-from langchain.output_parsers import PydanticOutputParser
-from cstgenai_common_entities.model import END, GENERATE, AGENT_WITH_TOOLS
-
-async def route_question(state: GraphState) -> GraphState:
-    logger.info(msg="Graph State: %s", state)
-
-    # if already ended, keep it
-    if state.get("next_step") == END:
-        return state
-
-    question_router = await init_question_router(state)
-
-    question = state["question"]
-    response = question_router.invoke({"question": question})
-    logger.info("Response from Question Router: %s", response)
-
-    output_parser = PydanticOutputParser(pydantic_object=RouteQuery)
-    source: RouteQuery = await output_parser.ainvoke(response)
-    logger.info("Router parsed: %s", source)
-
-    # --- store routing plan in state ---
-    state["tools_required"] = source.tools_needed or 0
-    state["pending_generate_part"] = (source.generate_part or "").strip() or None
-    state["tool_part"] = (source.tool_part or "").strip() or None
-
-    # Decide first hop
-    next_step = source.datasource
-
-    # If we have tool_part, ALWAYS go to tools first
-    if state["tool_part"]:
-        next_step = AGENT_WITH_TOOLS
-
-        # Make tool agent see only tool_part as the latest user input
-        state["question"] = state["tool_part"]
-        state.setdefault("messages", [])
-        state["messages"].append(HumanMessage(content=state["tool_part"]))
-
-    else:
-        # no tools needed
-        state["question"] = question  # keep original
-        # If router says GENERATE, set a safe default prompt key
-        if next_step == GENERATE:
-            state.setdefault("generate_prompt_key", "DEFAULT_PROMPT")
-
-    state["next_step"] = next_step
-    return state
-
-
-
-from langchain_core.messages import HumanMessage
-from cstgenai_common_entities.model import GENERATE, AGGREGATE
-
-pending = state.get("pending_generate_part")
-
-if pending:
-    state.setdefault("messages", [])
-    state["messages"].append(HumanMessage(content=pending))
-    state["question"] = pending
-
-    # pick the right prompt key for direct/general question answering
-    state["generate_prompt_key"] = state.get("generate_prompt_key") or "DEFAULT_PROMPT"
-
-    state["next_step"] = GENERATE
-else:
-    # no remaining direct question, go aggregate
-    state["next_step"] = AGGREGATE
-
-
-
 import logging
-from typing import Literal, Optional
+from typing import Literal, get_args
 
 from pydantic import BaseModel, Field
-from langchain.output_parsers import PydanticOutputParser
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 
-from cstgenai_common_entities.model import RETRIEVE, GENERATE, END  # keep your constants
-from cstgenai_common_entities.model import AGENT_WITH_TOOLS, PDF_EXTRACT_INFO  # if you use these
-from cstgenai_rag.model.state import GraphState
 from cstgenai_rag.llm.llm_client import get_llm
-
-# Your existing helpers (based on your screenshots)
-# - get_tools_for_agent(state)
-# - render_text_description(tools)
-from cstgenai_rag.support.tools import get_tools_for_agent, render_text_description
+from cstgenai_rag.model.rag.state import GraphState
+from cstgenai_rag.tools.registry import get_tools_for_agent
+from langchain.tools.render import render_text_description
 
 logger = logging.getLogger(__name__)
 
-DatasourceType = Literal[RETRIEVE, GENERATE, AGENT_WITH_TOOLS, PDF_EXTRACT_INFO]
+DatasourceType = Literal["RETRIEVE", "AGENT_WITH_TOOLS", "PDF_EXTRACT_INFO"]
 
 
 class RouteQuery(BaseModel):
-    """
-    Router output schema.
+    """Route a user query to the most relevant datasource."""
 
-    datasource:
-      - AGENT_WITH_TOOLS: use MCP tools
-      - RETRIEVE: use vector store/docs retrieval
-      - GENERATE: general LLM answer
-      - PDF_EXTRACT_INFO: file-based extraction (if you have it)
-    """
     datasource: DatasourceType = Field(
-        description="Choose where to route the user query."
+        description=f"Given a user question choose to route it to one of: "
+        f"{', '.join(get_args(DatasourceType))}."
     )
+    tools_needed: int = 0
 
-    tools_needed: int = Field(
-        default=0,
-        description="How many tool calls are needed (0 if none)."
-    )
-
-    tool_question: Optional[str] = Field(
-        default=None,
-        description="Only the part of the user query that MUST be solved via tools."
-    )
-
-    general_question: Optional[str] = Field(
-        default=None,
-        description="Only the part of the user query that can be answered by the LLM without tools."
-    )
+    # NEW: whether we should go into VAMP flow after GENERATE
+    vamp_intent: bool = False
 
 
 async def init_question_router(state: GraphState):
     """
-    Creates the routing chain. Uses tool descriptions to help the LLM decide.
+    Build and return the LLM used for routing the user question.
+
+    This is where we define the system prompt that:
+    - decides which datasource to use (AGENT_WITH_TOOLS / RETRIEVE / PDF_EXTRACT_INFO)
+    - decides how many tools are needed
+    - decides whether VAMP should be triggered (vamp_intent)
     """
+
     llm = get_llm(stream=False)
 
+    # Await your coroutine to get tools
+    options = " | ".join(get_args(RouteQuery.model_fields["datasource"].annotation))
     tools = await get_tools_for_agent(state)
     tools_description = render_text_description(tools)
 
-    # IMPORTANT: we force strict JSON output that matches RouteQuery
-    parser = PydanticOutputParser(pydantic_object=RouteQuery)
-    format_instructions = parser.get_format_instructions()
+    # JSON skeleton the LLM must fill
+    json_template = f"""
+{{
+  "datasource": "{{datasource}}",
+  "options": {options},
+  "tools_needed": 1|2|3...,
+  "vamp_intent": false
+}}
+"""
 
+    # ---- System prompt ----
+    # NOTE: we prepend the VAMP rule but keep your original rules intact.
     system = f"""
-You are an expert router that decides how to process a user request.
+### Additional VAMP Classification Rule (DO NOT MODIFY EXISTING RULES BELOW)
+You must determine whether the user's question requires intelligence from
+previous AIT assessments (VAMP intelligence).
 
-You MUST output ONLY valid JSON matching this schema:
-{format_instructions}
+Set "vamp_intent": true when the question includes any of:
+- suggestions on what to test
+- recommendations on how to test the application
+- "steps followed in their assessment"
+- "similar AITs"
+- "what did other testers find"
+- "give me suggestions"
+- anything requiring previous assessment knowledge
 
-Available tools:
+Otherwise, set "vamp_intent": false.
+
+You are an expert at routing a user question to {options}.
+Decide if a tool from the list of Available tools can fulfill the user's request.
+
+###Available tools:
 {tools_description}
 
-Rules:
-1) If ANY part of the question requires tool data (e.g., CVE lookup, application details, SAST/DAST, internal systems),
-   then set datasource = "AGENT_WITH_TOOLS" and put ONLY that part into "tool_question".
-2) If part of the question is general knowledge (e.g., "capital of Ireland"), put ONLY that part into "general_question".
-3) If both exist, include BOTH fields. In that case datasource should still be "AGENT_WITH_TOOLS".
-4) If no tool is needed:
-   - Use RETRIEVE if the user is asking about knowledgebase/docs and context must be fetched
-   - Else use GENERATE
-5) "tools_needed" should be a small integer estimate (0 if none). If datasource is AGENT_WITH_TOOLS, set at least 1.
+###Rules to be followed
+1. If any tool/tools can answer; respond {{AGENT_WITH_TOOLS}}, along with the count of tools that are needed.
+   Do **NOT** generate any new tool/function names. You can only use tools/function from the list of Available tools.
+2. If the question is relating to the testing how to test an AIT or suggestions about how to test the Application(AIT),
+   and tools are not sufficient, you may still choose GENERATE as datasource but must set vamp_intent=true.
+3. If it requires gathering information from a knowledge base or documents then {{RETRIEVE}}.
+4. If user has uploaded a file and is asking questions based on uploaded content then {{PDF_EXTRACT_INFO}}.
+5. If you can't decide, use default option of {{RETRIEVE}}.
 
-Examples:
-
-User: "Give me CVE-2024-1234 and what is the capital of Ireland?"
-Output:
-{{
-  "datasource": "AGENT_WITH_TOOLS",
-  "tools_needed": 1,
-  "tool_question": "Give me CVE-2024-1234",
-  "general_question": "What is the capital of Ireland?"
-}}
-
-User: "What is the capital of Ireland?"
-Output:
-{{
-  "datasource": "GENERATE",
-  "tools_needed": 0,
-  "tool_question": null,
-  "general_question": "What is the capital of Ireland?"
-}}
-""".strip()
+Be concise and respond only in JSON format as {json_template}.
+"""
 
     route_prompt = ChatPromptTemplate.from_messages(
         [
@@ -234,94 +97,248 @@ Output:
         ]
     )
 
-    # Model call will return a message; parser runs on top.
     question_router = route_prompt | llm
-    return question_router, parser
+    return question_router
+
+
+
+
+import logging
+
+from langchain_core.output_parsers import PydanticOutputParser
+from langgraph.constants import END
+
+from cstgenai_rag.graph.chains.router import RouteQuery, init_question_router
+from cstgenai_rag.model.rag.state import GraphState
+
+logger = logging.getLogger(__name__)
 
 
 async def route_question(state: GraphState) -> GraphState:
-    """
-    This node:
-    - reads state["question"]
-    - uses the LLM to decide datasource
-    - if the query is mixed, splits into tool_question + general_question
-    - sets state so tool-flow sees ONLY tool_question (keeps tool-executor clean)
-    """
-    logger.info("Graph State (incoming): %s", state)
+    logger.info(msg=f"Graph State: {state}")
+    next_step = state.get("next_step")
 
-    # If already ended, do nothing
-    if state.get("next_step") == END:
+    # If something upstream already decided to end, respect it
+    if next_step and next_step == END:
         return state
 
-    question = state.get("question")
-    if not question:
-        logger.warning("No 'question' found in state; routing to GENERATE as fallback.")
-        state["next_step"] = GENERATE
-        state["tools_required"] = 0
-        # prevent KeyError later
-        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
-        return state
+    # Build router LLM (uses tools + system prompt)
+    question_router = await init_question_router(state)
 
-    logger.info("---ROUTE QUESTION---")
-    logger.info("User question: %s", question)
+    logger.info("--ROUTE QUESTION--")
+    question = state["question"]
+    logger.info(f"Asking question router with question of type {type(question)}")
 
-    question_router, parser = await init_question_router(state)
+    # Call router LLM
+    response = question_router.invoke({"question": question})
 
-    # invoke router
-    response_msg = question_router.invoke({"question": question})
-    logger.info("Router raw response: %s", response_msg)
+    # Parse into RouteQuery
+    output_parser = PydanticOutputParser(pydantic_object=RouteQuery)
+    source = await output_parser.ainvoke(response)
 
-    # parse structured result
-    try:
-        source: RouteQuery = await parser.ainvoke(response_msg)
-    except Exception as e:
-        logger.exception("Failed to parse router output into RouteQuery. Error=%s", e)
-        # fallback: treat as normal generate
-        state["next_step"] = GENERATE
-        state["tools_required"] = 0
-        state["general_question"] = question
-        state["tool_question"] = None
-        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
-        return state
+    next_step = source.datasource
+    tools_needed = source.tools_needed
+    vamp_intent = source.vamp_intent
 
-    logger.info("Router parsed result: %s", source)
+    logger.info(f"Router answered: {source}")
 
-    tool_q = (source.tool_question or "").strip()
-    gen_q = (source.general_question or "").strip()
+    # Update state
+    state["vamp_intent"] = vamp_intent
 
-    # Persist split questions
-    state["tool_question"] = tool_q or None
-    state["general_question"] = gen_q or None
-    state["has_general_question"] = bool(gen_q)
-    state["has_tool_question"] = bool(tool_q)
-
-    # The KEY idea:
-    # If tool_q exists => set state["question"] to tool_q so tool-flow executes ONLY tool stuff.
-    # general_question remains stored for GENERATE later.
-    if tool_q:
-        state["question"] = tool_q
-        state["next_step"] = AGENT_WITH_TOOLS
-        state["tools_required"] = max(int(source.tools_needed or 0), 1)
-        # keep a safe default so generate step never KeyErrors later
-        state.setdefault("generate_prompt_key", "SYNTHESIZE_NON_TEMPLATED_TOOL_OUTPUT")
-    else:
-        # No tools, run what router decided (RETRIEVE or GENERATE)
-        state["question"] = gen_q or question
-        state["next_step"] = source.datasource if source.datasource in (RETRIEVE, GENERATE, PDF_EXTRACT_INFO) else GENERATE
-        state["tools_required"] = 0
-        state.setdefault("generate_prompt_key", "GENERAL_GENERATE")
-
-    # Keep router output in messages for traceability (optional; matches your existing style)
-    # NOTE: If your graph expects messages to accumulate, LangGraph will merge.
     return {
-        "messages": [response_msg],
-        "next_step": state["next_step"],
-        "tools_required": state.get("tools_required", 0),
-        "tool_question": state.get("tool_question"),
-        "general_question": state.get("general_question"),
-        "has_general_question": state.get("has_general_question", False),
-        "has_tool_question": state.get("has_tool_question", False),
-        "question": state.get("question"),
-        "generate_prompt_key": state.get("generate_prompt_key"),
+        "messages": [response],
+        "next_step": next_step,
+        "tools_required": tools_needed,
+        "vamp_intent": vamp_intent,
     }
 
+
+
+
+
+
+
+import logging
+
+from cstgenai_common_entities.model.constants import LAST
+from cstgenai_common_entities.model.prompt import Prompt
+from langchain_core.messages import AIMessage
+
+from cstgenai_rag.model.rag.state import GraphState
+from cstgenai_rag.support.db import get_repository_manager
+from cstgenai_rag.llm.llm_client import get_llm
+
+logger = logging.getLogger(__name__)
+
+llm = get_llm(stream=False)
+
+
+def synthesise_response(state: GraphState) -> GraphState:
+    """
+    GENERATE node: synthesise an answer based on previous stage data
+    (tools, RAG, etc.) using the configured prompt templates.
+
+    IMPORTANT:
+    - We do NOT end the workflow here.
+    - `next_step` is set to None so that conditional routing can decide
+      whether to go to VAMP_RETRIEVE or END.
+    """
+
+    last_stage_data = state.get("last_stage_data")
+    logger.info("--GENERATE: synthesise based on tool / vector store response--")
+
+    messages = state["messages"]
+    prompt_key = state.get("generate_prompt_key")
+
+    repo_manager = get_repository_manager()
+    prompt_repo = repo_manager.prompt_repo
+
+    prompt: Prompt | None = prompt_repo.find_one(filter_query={"key": prompt_key})
+
+    if prompt:
+        prompt_message = prompt.content
+        logger.debug(f"Using template prompt for key={prompt_key}")
+    else:
+        logger.warning(f"No prompt template found for key={prompt_key}")
+        prompt_message = f"System Prompt. Context messages: {messages}"
+
+    # Invoke model
+    response = llm.invoke(prompt_message)
+
+    return {
+        "messages": [AIMessage(content=response.content)],
+        # CRITICAL: allow workflow to route to VAMP or END
+        "next_step": None,
+        "last_stage_data": last_stage_data,
+    }
+
+
+
+
+
+
+
+import json
+import logging
+import os
+from typing import Any, Dict, List
+
+from langchain_core.messages import SystemMessage
+from cstgenai_rag.model.rag.state import GraphState
+from cstgenai_rag.model.rag.models import VectorStoreRequest
+from cstgenai_rag.support.db import get_vector_store_retriever
+
+# Import your VAMP client abstraction (to be implemented or mocked)
+from cstgenai_rag.support.vamp_client import get_vamp_client
+
+logger = logging.getLogger(__name__)
+
+
+async def vamp_retrieve(state: GraphState) -> GraphState:
+    """
+    Node: VAMP_RETRIEVE
+
+    Purpose:
+        - Fetches previous AIT assessments or similar penetration tests from VAMP.
+        - Combines them with current question context and tool/RAG outputs.
+        - Returns them for final GENERATE or synthesis stage.
+
+    Input State:
+        - question: the user's question string
+        - vamp_intent: bool (True if this node should trigger)
+        - metadata_filter: optional dict
+        - ait_id / app_profile: optional identifiers for context matching
+
+    Output State:
+        - documents: list of VAMP-derived text blocks
+        - messages: [SystemMessage] with summarised prompt context
+        - has_vamp_data: bool
+        - vamp_similar_aits: list of raw VAMP entries (for downstream analytics)
+    """
+
+    logger.info("--VAMP FLOW RETRIEVAL START--")
+
+    question = state.get("question", "")
+    messages = state.get("messages", [])
+    metadata_filter: Dict[str, Any] = state.get("metadata_filter", {}) or {}
+
+    # Capture last AI message content for continuity
+    ai_messages = [m for m in messages if hasattr(m, "type") and m.type == "ai"]
+    last_ai_content = ai_messages[-1].content if ai_messages else ""
+
+    # Prepare placeholders
+    documents: List[str] = []
+    has_vamp_data = False
+    vamp_similar_aits: List[Dict[str, Any]] = []
+
+    # Identify current assessment info
+    ait_id = state.get("ait_id") or metadata_filter.get("ait_id")
+    app_profile = state.get("app_profile") or metadata_filter.get("app_profile")
+
+    try:
+        vamp_client = get_vamp_client()
+        if ait_id:
+            vamp_similar_aits = await vamp_client.get_similar_aits(
+                ait_id=ait_id,
+                app_profile=app_profile,
+                limit=int(os.getenv("VAMP_SIMILAR_AITS_LIMIT", "5")),
+            )
+            logger.info(f"Fetched {len(vamp_similar_aits)} similar AITs from VAMP for AIT={ait_id}")
+        else:
+            logger.warning("AIT ID not found in state or metadata_filter; skipping VAMP retrieval.")
+
+    except Exception as e:
+        logger.exception(f"Error while retrieving similar AITs from VAMP: {e}")
+
+    # Format VAMP data into readable blocks
+    if vamp_similar_aits:
+        has_vamp_data = True
+        vamp_json = json.dumps(vamp_similar_aits, indent=2, ensure_ascii=False)
+        vamp_text = (
+            "PREVIOUS PEN-TEST ASSESSMENTS (VAMP Intelligence):\n\n"
+            "These are similar AITs tested by penetration testers in the past.\n"
+            "Use them as RED intelligence (previous assessments) when providing recommendations.\n\n"
+            f"{vamp_json}"
+        )
+        documents.append(vamp_text)
+    else:
+        documents.append("No relevant VAMP assessments were found for this AIT context.")
+        logger.info("No similar AITs found from VAMP.")
+
+    # ------------------------------------------------------------------
+    # Construct the system message to guide the final generation step
+    # ------------------------------------------------------------------
+    vamp_system_prompt = f"""
+You are assisting a penetration tester with planning what to test and how to test it.
+
+You now have access to:
+- Product profile and client context (YELLOW)
+- Application attributes and technology stack (MAGENTA)
+- The user's question and testing intent (GREEN)
+- Historical VAMP data from previous penetration assessments (RED)
+
+Original question:
+{question}
+
+Previous AI/Tool response:
+{last_ai_content}
+
+Instructions:
+1. Use the VAMP (RED) data as reference to suggest what to test and how.
+2. Combine YELLOW + MAGENTA + GREEN + RED to produce concrete test recommendations.
+3. Highlight patterns observed in previous AITs (e.g. repeated vulnerabilities).
+4. Avoid restating old results verbatim — instead, adapt them to the current application.
+5. If VAMP data is empty, respond based on generic testing recommendations.
+
+Respond concisely but informatively.
+""".strip()
+
+    logger.debug("Constructed VAMP system prompt for final generation phase.")
+
+    return {
+        "documents": documents,
+        "messages": [SystemMessage(content=vamp_system_prompt)],
+        "has_vamp_data": has_vamp_data,
+        "vamp_similar_aits": vamp_similar_aits,
+        "next_step": None,  # allow graph to terminate or continue as configured
+    }
